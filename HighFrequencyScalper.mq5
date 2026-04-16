@@ -88,6 +88,15 @@ void OnDeinit(const int)
   if(hAtr!=INVALID_HANDLE)     IndicatorRelease(hAtr);
 }
 
+void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& req,const MqlTradeResult& res)
+{
+  if(trans.type==TRADE_TRANSACTION_DEAL_ADD && trans.deal_entry==DEAL_ENTRY_OUT)
+  {
+    gDailyPnL += trans.profit;
+    SaveDailyState();
+  }
+}
+
 void OnTimer()
 {
   if(NewDay())
@@ -98,6 +107,7 @@ void OnTimer()
 void OnTick()
 {
   if(gBreaker) return;
+  ManagePositions();
   if(TimeCurrent() < gNextAllowed) return;
   if(!MarketGate()) return;
 
@@ -337,4 +347,109 @@ void CheckBreaker()
   if(ddPct <= -InpDailyLossPct) gBreaker = true;
   if(gTradesToday >= InpMaxTradesPerDay) gBreaker = true;
   if(gErrorStreak >= 3) gBreaker = true;
+}
+
+//--- position management
+double CurrentAtrPoints()
+{
+  double atr[];
+  if(CopyBuffer(hAtr,0,0,1,atr)!=1) return 0;
+  return atr[0]/_Point;
+}
+
+void ManagePositions()
+{
+  double atrPts = CurrentAtrPoints();
+  for(int i=PositionsTotal()-1;i>=0;i--)
+  {
+    if(!PositionSelectByIndex(i)) continue;
+    string sym = PositionGetString(POSITION_SYMBOL);
+    if(sym!=InpSymbol) continue;
+    long ticket = PositionGetInteger(POSITION_TICKET);
+    int type = (int)PositionGetInteger(POSITION_TYPE);
+    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+    double sl    = PositionGetDouble(POSITION_SL);
+    double tp    = PositionGetDouble(POSITION_TP);
+    datetime opentime = (datetime)PositionGetInteger(POSITION_TIME);
+    double price = (type==POSITION_TYPE_BUY) ? SymbolInfoDouble(InpSymbol,SYMBOL_BID) : SymbolInfoDouble(InpSymbol,SYMBOL_ASK);
+
+    // Time stop
+    if(InpTimeStopBars>0)
+    {
+      int bars = (int)((TimeCurrent() - opentime)/PeriodSeconds(InpTF));
+      if(bars > InpTimeStopBars)
+      {
+        ClosePosition(ticket,type);
+        continue;
+      }
+    }
+
+    // Break-even
+    if(InpUseBE && InpBETrigger>0)
+    {
+      double profitPts = (type==POSITION_TYPE_BUY) ? (price - entry)/_Point : (entry - price)/_Point;
+      if(profitPts >= InpBETrigger)
+      {
+        double newSL = (type==POSITION_TYPE_BUY) ? entry + InpBEOffset*_Point : entry - InpBEOffset*_Point;
+        bool better = (type==POSITION_TYPE_BUY && (sl==0 || newSL>sl)) || (type==POSITION_TYPE_SELL && (sl==0 || newSL<sl));
+        if(better)
+        {
+          ModifySLTP(ticket,newSL,tp);
+          sl = newSL;
+        }
+      }
+    }
+
+    // Trailing
+    if(InpTrailMode==TRAIL_ATR && atrPts>0 && InpTrailATRMult>0)
+    {
+      double trailPts = atrPts * InpTrailATRMult;
+      double desiredSL = (type==POSITION_TYPE_BUY) ? price - trailPts*_Point : price + trailPts*_Point;
+      bool improve = (type==POSITION_TYPE_BUY && (sl==0 || desiredSL>sl)) || (type==POSITION_TYPE_SELL && (sl==0 || desiredSL<sl));
+      if(improve)
+      {
+        ModifySLTP(ticket,desiredSL,tp);
+      }
+    }
+  }
+}
+
+bool ModifySLTP(long ticket,double newSL,double newTP)
+{
+  MqlTradeRequest req;
+  MqlTradeResult  res;
+  ZeroMemory(req);
+  ZeroMemory(res);
+  req.action   = TRADE_ACTION_SLTP;
+  req.position = ticket;
+  req.symbol   = InpSymbol;
+  req.sl       = newSL;
+  req.tp       = newTP;
+  if(!OrderSend(req,res))
+  {
+    if(InpDebugLogging) Print("SLTP modify failed: ",res.retcode);
+    return false;
+  }
+  return res.retcode==TRADE_RETCODE_DONE;
+}
+
+bool ClosePosition(long ticket,int type)
+{
+  MqlTradeRequest req;
+  MqlTradeResult  res;
+  ZeroMemory(req);
+  ZeroMemory(res);
+  req.action   = TRADE_ACTION_DEAL;
+  req.position = ticket;
+  req.symbol   = InpSymbol;
+  req.volume   = PositionGetDouble(POSITION_VOLUME);
+  req.type     = (type==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+  req.price    = (req.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(InpSymbol,SYMBOL_ASK) : SymbolInfoDouble(InpSymbol,SYMBOL_BID);
+  req.deviation= (int)MathMax(InpSpreadCapPts, InpSlippageCapPts);
+  if(!OrderSend(req,res))
+  {
+    if(InpDebugLogging) Print("Close failed: ",res.retcode);
+    return false;
+  }
+  return res.retcode==TRADE_RETCODE_DONE;
 }
