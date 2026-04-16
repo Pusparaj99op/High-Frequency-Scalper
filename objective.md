@@ -80,3 +80,112 @@
 ## Observability
 - Log: signal reason, spread at entry, requested vs filled price, slippage, P/L, RR, circuit-breaker events.
 - Periodic summaries to Experts tab/file; optional webhook/alerts for breakers and large losses.
+
+## Implementation Blueprint (MT5)
+### Core Structure
+- Files: single EA `.mq5` with `OnInit`, `OnDeinit`, `OnTick`, `OnTimer`, helper functions; optional include for utils.
+- Global state: configuration inputs, indicator handles (fast EMA, slow EMA, VWAP/MA band, ATR), rolling slippage stats, per-symbol cooldowns, daily P/L and breaker flags (Global Variables).
+- Timers: 1–5s `OnTimer` for health checks, gate recalculation, and circuit-breaker logic; `OnTick` is lean for signal + execution.
+
+### Inputs (examples, defaults tuned for XAUUSD XM360)
+- `input string InpSymbol="XAUUSD";`
+- `input ENUM_TIMEFRAMES InpTF=PERIOD_M1;`
+- `input ENUM_STRATEGY_MODE InpMode=MODE_AUTO_TOGGLE; // BREAKOUT | MEAN_REVERSION | AUTO_TOGGLE`
+- `input double InpFixedLot=0.01;`
+- `input bool InpUseDynamicRisk=true;`
+- `input double InpRiskPerTradePct=0.3; // 0.25–0.5% suggested`
+- `input int InpMaxTradesPerDay=20;`
+- `input int InpMaxConcurrent=2;`
+- `input double InpDailyLossPct=3.0;`
+- `input double InpSpreadCapPts=30; // 25–35`
+- `input double InpSlippageCapPts=12; // 10–15`
+- `input double InpMarginBufferPct=30; // keep >=30–40% free margin after entry`
+- `input int InpCooldownSec=90;`
+- `input int InpTimeStopBars=15;`
+- `input int InpATRPeriod=14;`
+- `input double InpATRMin=50; input double InpATRMax=400;`
+- `input int InpTPpts=150; input int InpSLpts=120;`
+- `input bool InpUseBE=true; input int InpBETrigger=60; input int InpBEOffset=10;`
+- `input bool InpUseTrail=true; input int InpTrailATRMult=2;`
+- `input int InpMaxRetries=2; input int InpRetryDelayMs=150;`
+- `input int InpTimerSeconds=2;`
+- Logging toggles and webhook URL (optional).
+
+### State and Helpers
+- `struct TradeStats { double dailyPnL; int tradesToday; datetime dayStamp; int errorStreak; double slippageMedian; }`
+- `struct Cooldown { datetime nextAllowed; }`
+- Functions: `LoadHandles()`, `UpdateIndicators()`, `CheckMarketGate()`, `SelectMode()`, `HasOpenPositions()`, `ComputeLot()`, `BuildSignalBreakout()`, `BuildSignalMeanRev()`, `PlaceOrder()`, `ManageOpenPositions()`, `UpdateStatsOnTrade()`, `CircuitBreakerTriggered()`.
+- Rolling median slippage: keep deque of last N (e.g., 20) fills (requested - filled in points); compute median/95th quickly (simple sort small N).
+- Persist breaker/daily PnL via `GlobalVariableSet`, keyed by symbol+day.
+
+### OnInit
+- Validate symbol availability; subscribe to ticks.
+- Create indicators: fast/slow EMA, ATR; prepare buffers.
+- Set timer to `InpTimerSeconds`.
+- Load persisted daily P/L and breaker state; reset if day changed.
+
+### OnTimer (health + gates)
+- Recalculate spread/slippage gates and ATR band.
+- Refresh margin rates, leverage, lot step/min/max.
+- Reset daily counters if day rolled.
+- Evaluate circuit-breaker (daily loss, error streak, max trades/day).
+- Pre-compute lot ceiling given margin buffer.
+
+### OnTick (signal + execution)
+1) If circuit-breaker active or cooldown in effect → return.
+2) Compute/refresh indicator values minimally (pull latest handles).
+3) Run `CheckMarketGate`: spread <= cap, slippage median <= cap, ATR within [min, max], not in blackout (rollover/news).
+4) Determine active mode: `InpMode` or auto-toggle (e.g., ATR regime or recent mode win rate).
+5) Build signal:
+   - Breakout: recent high/low break (lookback L), momentum via fast EMA slope or RSI delta, price > fast EMA for longs, spread healthy.
+   - Mean-reversion: z-score of price vs EMA/VWAP band; enter back to mean when z-score exceeds threshold and momentum fading.
+6) If signal passes and no conflicting open position count > limits:
+   - Compute lot: fixed 0.01; if dynamic risk enabled, lot = risk% * balance / (SL pts * tickValue/point), then clamp to min/max and margin buffer.
+   - Send order with deviation tied to `max(InpSpreadCapPts, spread*1.2)` but bounded; filling FOK, fallback IOC if unsupported.
+   - Retry on requote/off-quotes up to `InpMaxRetries` with `InpRetryDelayMs`.
+   - On success, set SL/TP server-side immediately; record entry time for time-stop; store requested vs filled for slippage stats; set cooldown.
+
+### Trade Management (per tick/per timer)
+- Break-even: when profit >= `InpBETrigger`, move SL to entry + `InpBEOffset`.
+- Trailing: ATR-based trail behind price; only tighten.
+- Time-stop: close if bars since entry > `InpTimeStopBars`.
+- Partial take-profit (optional): close fraction at RR milestone; tighten SL.
+- Close on circuit-breaker trigger.
+
+### Risk Controls
+- Daily loss breaker: if daily P/L <= -`InpDailyLossPct`% balance → halt new trades.
+- Max trades/day and max concurrent enforced before entry.
+- Error-streak breaker: consecutive trade errors > threshold → pause until timer resets.
+- Cooldown per symbol after close or failed attempt.
+
+### Adaptivity
+- Adjust allowed deviation using recent slippage percentile; widen only within cap.
+- Increase minimum TP if spread widens (ensure TP covers spread + expected slippage).
+- Auto-toggle: choose breakout when ATR high and spreads tight; mean-reversion when ATR mid and no trend; disable entries when ATR too low/high.
+
+### Logging/Telemetry
+- Per trade: signal type, spread, ATR, requested/fill, slippage pts, lot, SL/TP, outcome.
+- Periodic summary (timer): equity, daily P/L, slippage median/95th, spread avg/max, gate status, breaker status.
+- Optional webhook on breaker events and large losses.
+
+### Testing Checklist
+- Strategy Tester: tick-by-tick with spread 20–60 pts, slippage 0–20 pts; confirm gates block bad conditions.
+- Stress: widened spread, high ATR; ensure breaker halts; ensure retries bounded.
+- Forward demo: compare requested vs fill, slippage distribution; verify cooldown and time-stop behavior.
+
+### Minimal Pseudocode Sketch (structure)
+```
+int OnInit() { LoadHandles(); SetTimer(InpTimerSeconds); LoadState(); return INIT_SUCCEEDED; }
+void OnDeinit(const int) { KillTimer(); ReleaseHandles(); }
+void OnTimer() { RefreshSymbolInfo(); UpdateGates(); ResetIfNewDay(); if (Breaker()) disable=true; }
+void OnTick() {
+  if (disable || CooldownActive()) return;
+  if (!CheckMarketGate()) return;
+  Mode m = SelectMode();
+  Signal s = (m==BREAKOUT) ? BuildBreakout() : BuildMeanRev();
+  if (!s.valid) return;
+  if (PositionLimitHit()) return;
+  double lot = ComputeLot(s.slPoints);
+  if (!PlaceOrder(s.dir, lot, s.sl, s.tp)) { RecordError(); return; }
+  RecordFill(); SetCooldown(); }
+```
