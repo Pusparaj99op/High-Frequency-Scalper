@@ -189,3 +189,14 @@ void OnTick() {
   if (!PlaceOrder(s.dir, lot, s.sl, s.tp)) { RecordError(); return; }
   RecordFill(); SetCooldown(); }
 ```
+
+## EA Skeleton Implemented
+- Added `HighFrequencyScalper.mq5` with:
+  - Inputs per plan (symbol, mode toggle, risk, gating, TP/SL, BE, trailing, retries, timers).
+  - OnInit/OnDeinit/OnTimer/OnTick scaffolding.
+  - Market gate (spread, ATR band, slippage median).
+  - Strategy modes: breakout vs mean-reversion selection with auto toggle.
+  - Lot sizing with optional dynamic risk, margin buffer, volume step clamping.
+  - Order placement with FOK, bounded retries, slippage recording, cooldown.
+  - Daily state persistence via Global Variables, circuit breaker (daily loss, trades/day, error streak).
+  - Simple signal logic placeholders; extend with richer entry logic and management (BE/trail/time-stop hooks to add).
