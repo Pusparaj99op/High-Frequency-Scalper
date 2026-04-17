@@ -1,6 +1,6 @@
 #property copyright "Codex"
 #property link      "https://github.com/Pusparaj99op/High-Frequency-Scalper"
-#property version   "1.00"
+#property version   "1.01"
 #property strict
 
 enum StrategyMode { MODE_BREAKOUT=0, MODE_MEAN_REVERSION=1, MODE_AUTO_TOGGLE=2 };
@@ -11,17 +11,17 @@ input ENUM_TIMEFRAMES InpTF              = PERIOD_M1;
 input StrategyMode  InpMode              = MODE_AUTO_TOGGLE; // BREAKOUT | MEAN_REVERSION | AUTO_TOGGLE
 input double        InpFixedLot          = 0.01;
 input bool          InpUseDynamicRisk    = true;
-input double        InpRiskPerTradePct   = 0.3;   // suggested 0.25–0.5
+input double        InpRiskPerTradePct   = 30.0;  // suggested 0.25–0.5
 input int           InpMaxTradesPerDay   = 20;
 input int           InpMaxConcurrent     = 2;
-input double        InpDailyLossPct      = 3.0;
-input double        InpSpreadCapPts      = 30;    // 25–35 suggested
+input double        InpDailyLossPct      = 100.0;
+input double        InpSpreadCapPts      = 40;    // 25–35 suggested
 input double        InpSlippageCapPts    = 12;    // 10–15 suggested
 input double        InpMarginBufferPct   = 30;    // keep >=30–40% free margin
 input int           InpCooldownSec       = 90;
 input int           InpTimeStopBars      = 15;
 input int           InpATRPeriod         = 14;
-input double        InpATRMin            = 50;
+input double        InpATRMin            = 10;
 input double        InpATRMax            = 400;
 input int           InpTPpts             = 150;
 input int           InpSLpts             = 120;
@@ -90,10 +90,16 @@ void OnDeinit(const int)
 
 void OnTradeTransaction(const MqlTradeTransaction& trans,const MqlTradeRequest& req,const MqlTradeResult& res)
 {
-  if(trans.type==TRADE_TRANSACTION_DEAL_ADD && trans.deal_entry==DEAL_ENTRY_OUT)
+  if(trans.type==TRADE_TRANSACTION_DEAL_ADD)
   {
-    gDailyPnL += trans.profit;
-    SaveDailyState();
+    if(HistoryDealSelect(trans.deal))
+    {
+      if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+      {
+        gDailyPnL += HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+        SaveDailyState();
+      }
+    }
   }
 }
 
@@ -169,8 +175,9 @@ bool MarketGate()
   if(spreadPts > InpSpreadCapPts) return false;
 
   double atr[];
-  if(CopyBuffer(hAtr,0,0,1,atr)!=1) return false;
-  if(atr[0] < InpATRMin*_Point || atr[0] > InpATRMax*_Point) return false;
+  if(CopyBuffer(hAtr,0,0,2,atr)!=2) return false;
+  ArraySetAsSeries(atr,true);
+  if(atr[1] < InpATRMin*_Point || atr[1] > InpATRMax*_Point) return false;
 
   double medianSlip = MedianSlippage();
   if(medianSlip > InpSlippageCapPts) return false;
@@ -183,10 +190,14 @@ Signal BuildSignal()
   double fast[], slow[], atr[];
   if(CopyBuffer(hFastEma,0,0,3,fast)!=3) return s;
   if(CopyBuffer(hSlowEma,0,0,3,slow)!=3) return s;
-  if(CopyBuffer(hAtr,0,0,1,atr)!=1) return s;
+  if(CopyBuffer(hAtr,0,0,2,atr)!=2) return s;
+
+  ArraySetAsSeries(fast,true);
+  ArraySetAsSeries(slow,true);
+  ArraySetAsSeries(atr,true);
 
   double price = SymbolInfoDouble(InpSymbol,SYMBOL_BID);
-  double atrPts = atr[0]/_Point;
+  double atrPts = atr[1]/_Point;
 
   StrategyMode mode = SelectMode(atrPts,fast,slow);
   if(mode==MODE_BREAKOUT)
@@ -199,7 +210,7 @@ Signal BuildSignal()
 StrategyMode SelectMode(double atrPts,const double &fast[],const double &slow[])
 {
   if(InpMode!=MODE_AUTO_TOGGLE) return InpMode;
-  bool trending = MathAbs(fast[0]-slow[0]) > 0.2*atrPts*_Point;
+  bool trending = MathAbs(fast[1]-slow[1]) > 0.2*atrPts*_Point;
   if(trending) return MODE_BREAKOUT;
   return MODE_MEAN_REVERSION;
 }
@@ -207,22 +218,24 @@ StrategyMode SelectMode(double atrPts,const double &fast[],const double &slow[])
 Signal BuildBreakout(double price,const double &fast[],const double &slow[],double atrPts)
 {
   Signal s; s.valid=false;
+  bool buyCross = (fast[1] > slow[1] && fast[2] <= slow[2]);
+  bool sellCross = (fast[1] < slow[1] && fast[2] >= slow[2]);
   double high = iHigh(InpSymbol,InpTF,1);
   double low  = iLow(InpSymbol,InpTF,1);
-  if(price > high && fast[0] > slow[0])
+  if(buyCross && price > high)
   {
     s.dir = ORDER_TYPE_BUY;
-    s.slPoints = InpSLpts;
-    s.sl = price - InpSLpts*_Point;
-    s.tp = price + InpTPpts*_Point;
+    s.slPoints = MathMax((double)InpSLpts, atrPts * 1.0);
+    s.sl = price - s.slPoints*_Point;
+    s.tp = price + (s.slPoints * 4.0)*_Point;
     s.valid = true;
   }
-  else if(price < low && fast[0] < slow[0])
+  else if(sellCross && price < low)
   {
     s.dir = ORDER_TYPE_SELL;
-    s.slPoints = InpSLpts;
-    s.sl = price + InpSLpts*_Point;
-    s.tp = price - InpTPpts*_Point;
+    s.slPoints = MathMax((double)InpSLpts, atrPts * 1.0);
+    s.sl = price + s.slPoints*_Point;
+    s.tp = price - (s.slPoints * 4.0)*_Point;
     s.valid = true;
   }
   return s;
@@ -232,21 +245,23 @@ Signal BuildMeanReversion(double price,const double &fast[],const double &slow[]
 {
   Signal s; s.valid=false;
   double band = 0.5*atrPts*_Point;
-  double mid = slow[0];
-  if(price < mid - band)
+  double mid = slow[1];
+  bool buyReversionCross = (price < mid - band && fast[1] > slow[1] && fast[2] <= slow[2]);
+  bool sellReversionCross = (price > mid + band && fast[1] < slow[1] && fast[2] >= slow[2]);
+  if(buyReversionCross)
   {
     s.dir = ORDER_TYPE_BUY;
-    s.slPoints = InpSLpts;
-    s.sl = price - InpSLpts*_Point;
-    s.tp = price + InpTPpts*_Point;
+    s.slPoints = MathMax((double)InpSLpts, atrPts * 1.0);
+    s.sl = price - s.slPoints*_Point;
+    s.tp = price + (s.slPoints * 4.0)*_Point;
     s.valid = true;
   }
-  else if(price > mid + band)
+  else if(sellReversionCross)
   {
     s.dir = ORDER_TYPE_SELL;
-    s.slPoints = InpSLpts;
-    s.sl = price + InpSLpts*_Point;
-    s.tp = price - InpTPpts*_Point;
+    s.slPoints = MathMax((double)InpSLpts, atrPts * 1.0);
+    s.sl = price + s.slPoints*_Point;
+    s.tp = price - (s.slPoints * 4.0)*_Point;
     s.valid = true;
   }
   return s;
@@ -276,15 +291,25 @@ double ComputeLot(double slPoints)
   double maxLot = SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_MAX);
   double step   = SymbolInfoDouble(InpSymbol,SYMBOL_VOLUME_STEP);
   lot = MathMin(maxLot, MathMax(minLot, lot));
-  lot = NormalizeDouble(MathFloor(lot/step)*step, (int)SymbolInfoInteger(InpSymbol,SYMBOL_VOLUME_DIGITS));
+  int digits = (int)-MathFloor(MathLog10(step));
+  if(digits < 0) digits = 0;
+  lot = NormalizeDouble(MathFloor(lot/step)*step, digits);
 
   double marginNeeded = 0;
   if(!OrderCalcMargin(ORDER_TYPE_BUY,InpSymbol,lot,SymbolInfoDouble(InpSymbol,SYMBOL_ASK),marginNeeded))
     return 0;
-  double freeMargin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+  double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
   double buffer = freeMargin * InpMarginBufferPct / 100.0;
   if(freeMargin - marginNeeded < buffer) return 0;
   return lot;
+}
+
+ENUM_ORDER_TYPE_FILLING GetFilling()
+{
+  int fillMode = (int)SymbolInfoInteger(InpSymbol,SYMBOL_FILLING_MODE);
+  if((fillMode & SYMBOL_FILLING_FOK) != 0) return ORDER_FILLING_FOK;
+  if((fillMode & SYMBOL_FILLING_IOC) != 0) return ORDER_FILLING_IOC;
+  return ORDER_FILLING_RETURN;
 }
 
 bool PlaceOrder(const Signal &s,double lot)
@@ -302,12 +327,12 @@ bool PlaceOrder(const Signal &s,double lot)
   req.sl       = s.sl;
   req.tp       = s.tp;
   req.deviation= (int)MathMax(InpSpreadCapPts, InpSlippageCapPts);
-  req.type_filling = ORDER_FILLING_FOK;
+  req.type_filling = GetFilling();
   for(int i=0;i<=InpMaxRetries;i++)
   {
     if(!OrderSend(req,res) || res.retcode!=TRADE_RETCODE_DONE)
     {
-      if(res.retcode==TRADE_RETCODE_REQUOTE || res.retcode==TRADE_RETCODE_OFF_QUOTES)
+      if(res.retcode==TRADE_RETCODE_REQUOTE || res.retcode==TRADE_RETCODE_PRICE_OFF)
       {
         Sleep(InpRetryDelayMs);
         continue;
@@ -335,7 +360,7 @@ double MedianSlippage()
   double tmp[];
   ArrayResize(tmp,n);
   for(int i=0;i<n;i++) tmp[i]=gLastSlippage[i];
-  ArraySort(tmp,WHOLE_ARRAY,0,MODE_ASCEND);
+  ArraySort(tmp);
   return tmp[n/2];
 }
 
@@ -362,7 +387,7 @@ void ManagePositions()
   double atrPts = CurrentAtrPoints();
   for(int i=PositionsTotal()-1;i>=0;i--)
   {
-    if(!PositionSelectByIndex(i)) continue;
+    if(PositionGetTicket(i)==0) continue;
     string sym = PositionGetString(POSITION_SYMBOL);
     if(sym!=InpSymbol) continue;
     long ticket = PositionGetInteger(POSITION_TICKET);
@@ -446,6 +471,7 @@ bool ClosePosition(long ticket,int type)
   req.type     = (type==POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
   req.price    = (req.type==ORDER_TYPE_BUY) ? SymbolInfoDouble(InpSymbol,SYMBOL_ASK) : SymbolInfoDouble(InpSymbol,SYMBOL_BID);
   req.deviation= (int)MathMax(InpSpreadCapPts, InpSlippageCapPts);
+  req.type_filling = GetFilling();
   if(!OrderSend(req,res))
   {
     if(InpDebugLogging) Print("Close failed: ",res.retcode);
