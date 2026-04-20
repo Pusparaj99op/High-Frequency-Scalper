@@ -18,7 +18,6 @@ input double        InpDailyLossPct      = 100.0;
 input double        InpSpreadCapPts      = 40;    // 25–35 suggested
 input double        InpSlippageCapPts    = 12;    // 10–15 suggested
 input double        InpMarginBufferPct   = 30;    // keep >=30–40% free margin
-input int           InpCooldownSec       = 90;
 input int           InpTimeStopBars      = 15;
 input int           InpATRPeriod         = 14;
 input double        InpATRMin            = 10;
@@ -41,7 +40,7 @@ int hSlowEma = INVALID_HANDLE;
 int hAtr     = INVALID_HANDLE;
 
 //--- state
-datetime gNextAllowed = 0;
+datetime gLastTradeBarTime = 0;
 double   gLastSlippage[20];
 int      gSlipCount = 0;
 double   gDailyPnL = 0.0;
@@ -114,7 +113,10 @@ void OnTick()
 {
   if(gBreaker) return;
   ManagePositions();
-  if(TimeCurrent() < gNextAllowed) return;
+  
+  datetime currentBarTime = iTime(InpSymbol, PERIOD_M1, 0);
+  if(currentBarTime == gLastTradeBarTime) return;
+
   if(!MarketGate()) return;
 
   Signal sig = BuildSignal();
@@ -128,7 +130,7 @@ void OnTick()
   {
     gTradesToday++;
     gErrorStreak = 0;
-    gNextAllowed = TimeCurrent() + InpCooldownSec;
+    gLastTradeBarTime = currentBarTime;
   }
   else
   {
